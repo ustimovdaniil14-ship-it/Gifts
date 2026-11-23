@@ -9,6 +9,8 @@ import aiohttp
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,9 +27,10 @@ from aiogram.types import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ.get("DATABASE_URL", "")  # строка подключения из Neon
 FREE_API_URL = os.environ.get("FREE_API_URL", "").rstrip("/")  # адрес твоего API для бесплатной отправки
+API_URL = os.environ.get("API_URL", "http://31.77.10.54:18081").rstrip("/")  # адрес не-оригинального Bot API
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x}
 
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(API_URL)))
 dp = Dispatcher()
 
 # ===== Настройки (меняются из бота через /settings) =====
