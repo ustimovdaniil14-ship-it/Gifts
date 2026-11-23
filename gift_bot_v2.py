@@ -37,7 +37,7 @@ dp = Dispatcher()
 
 # ===== Настройки (меняются из бота через /settings) =====
 SETTINGS_FILE = "settings.json"
-S = {"min_stars": 15, "max_stars": 100, "min_msgs": 3, "cooldown_min": 30, "daily_limit": 1, "custom_gifts": []}
+S = {"min_stars": 15, "max_stars": 100, "min_msgs": 3, "cooldown_min": 30, "daily_limit": 1, "custom_gifts": [], "banned_gifts": []}
 try:
     S.update(json.load(open(SETTINGS_FILE)))
 except Exception:
@@ -138,6 +138,8 @@ HELP = (
     "/gifts — список подарков Telegram с их ID\n"
     "/addgift ID — добавить подарок в розыгрыш по ID\n"
     "/delgift ID — убрать добавленный подарок\n"
+    "/ban ID — исключить подарок из розыгрыша (можно несколько ID через пробел)\n"
+    "/unban ID — вернуть подарок (/unban all — вернуть все)\n"
     "/topup 500 — пополнить баланс\n"
     "/cancel — отменить текущее действие\n\n"
     "В чате:\n"
@@ -353,7 +355,8 @@ async def load_pool() -> list[dict]:
         items[str(g.id)] = pool_item(g)
     for c in S["custom_gifts"]:
         items[str(c["id"])] = c
-    return list(items.values())
+    banned = {str(x) for x in S.get("banned_gifts", [])}
+    return [it for gid, it in items.items() if gid not in banned]
 
 
 async def api_send_gift(user_id: int, gift_id: str):
@@ -388,9 +391,11 @@ async def gifts_cmd(m: Message):
         it = pool_item(g)
         lim = "" if getattr(g, "total_count", None) is None else " (лимитка)"
         mark = " ➕" if str(g.id) in added else ""
+        if str(g.id) in {str(x) for x in S.get("banned_gifts", [])}:
+            mark += " 🚫"
         lines.append(f"{it['emoji']} {g.star_count} ⭐{lim}{mark} — {g.id}")
-    text = "🎁 Доступные подарки (➕ = добавлен тобой)\nОбычные участвуют сами, лимитки добавляй через /addgift\n\n"
-    await m.answer(text + "\n".join(lines)[:3800] + "\n\nДобавить: /addgift ID")
+    text = "🎁 Доступные подарки (➕ = добавлен тобой, 🚫 = исключён)\nВсе участвуют сами, кроме исключённых.\n\n"
+    await m.answer(text + "\n".join(lines)[:3800] + "\n\nИсключить: /ban ID\nВернуть: /unban ID")
 
 
 LAST_GROUP_MSG = {"t": 0, "chat": None, "title": None}
@@ -458,6 +463,35 @@ async def probe_cmd(m: Message):
         except Exception as e:
             out.append(f"{name}: ошибка {e}")
     await m.answer("\n\n".join(out)[:3800])
+
+
+@dp.message(Command("ban"), PRIVATE, ADMIN)
+async def ban_cmd(m: Message):
+    parts = m.text.split()
+    if len(parts) < 2:
+        await m.answer("Напиши так: /ban ID_подарка\nСписок ID: /gifts")
+        return
+    ids = [str(x) for x in S.get("banned_gifts", [])]
+    for gid in parts[1:]:
+        if gid not in ids:
+            ids.append(gid)
+    S["banned_gifts"] = ids
+    await save_settings()
+    await m.answer(f"🚫 Исключено. Сейчас исключено подарков: {len(ids)}\nВернуть: /unban ID")
+
+
+@dp.message(Command("unban"), PRIVATE, ADMIN)
+async def unban_cmd(m: Message):
+    parts = m.text.split()
+    if len(parts) < 2:
+        await m.answer("Напиши так: /unban ID_подарка (или /unban all, чтобы вернуть все)")
+        return
+    if parts[1] == "all":
+        S["banned_gifts"] = []
+    else:
+        S["banned_gifts"] = [x for x in S.get("banned_gifts", []) if str(x) not in parts[1:]]
+    await save_settings()
+    await m.answer(f"✅ Готово. Исключено подарков: {len(S['banned_gifts'])}")
 
 
 @dp.message(Command("addgift"), PRIVATE, ADMIN)
@@ -675,8 +709,11 @@ async def congratulate(uid: int, g: dict, title: str):
     try:
         await bot.send_message(
             uid,
-            f"🎉 Поздравляю! Ты получил {g['emoji']} {gift_word(g)} за {g['stars']} ⭐\n"
-            f"Награда за активность в чате «{title}». Проверь подарки в своём профиле 💙",
+            "🎉🎉🎉 Поздравляю! Ты выиграл в раздаче! 🎉🎉🎉\n\n"
+            f"🎁 Твой приз: {g['emoji']} {gift_word(g)} за {g['stars']} ⭐\n"
+            f"💬 Награда за активность в чате «{title}»\n\n"
+            "Подарок уже у тебя, загляни в сообщения и в профиль 💙\n"
+            "Пиши в чате и участвуй в следующих ивентах, будет ещё! 🍀",
         )
     except Exception:
         pass  # человек не запускал бота, напишем только в чате
