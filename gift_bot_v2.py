@@ -362,6 +362,19 @@ async def gifts_cmd(m: Message):
     await m.answer(text + "\n".join(lines)[:3800] + "\n\nДобавить: /addgift ID")
 
 
+@dp.message(Command("probe"), PRIVATE, ADMIN)
+async def probe_cmd(m: Message):
+    """Проверяет, какой метод твоего API отдаёт список подарков с их ID."""
+    out = []
+    for name in ("getAvailableGifts", "getGifts", "getStarGifts", "getGiftList", "getAllGifts", "gifts", "getUserGifts"):
+        try:
+            data = await raw_api(name)
+            out.append(f"{name}: {json.dumps(data, ensure_ascii=False)[:300]}")
+        except Exception as e:
+            out.append(f"{name}: ошибка {e}")
+    await m.answer("\n\n".join(out)[:3800])
+
+
 @dp.message(Command("addgift"), PRIVATE, ADMIN)
 async def addgift_cmd(m: Message):
     parts = m.text.split()
