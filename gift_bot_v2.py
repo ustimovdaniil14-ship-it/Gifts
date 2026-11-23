@@ -6,6 +6,7 @@ import time
 from datetime import date
 
 import aiohttp
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
@@ -22,6 +23,7 @@ from aiogram.types import (
 
 # ===== Переменные окружения (задаются на Render) =====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # строка подключения из Neon
 FREE_API_URL = os.environ.get("FREE_API_URL", "").rstrip("/")  # адрес твоего API для бесплатной отправки
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x}
 
@@ -45,11 +47,61 @@ LABELS = {
 }
 
 
-def save_settings():
+pool = None  # пул подключений к Neon (если задан DATABASE_URL)
+
+
+async def init_db():
+    """Подключаемся к Neon, создаём таблицы, подтягиваем настройки и сегодняшние победы."""
+    global pool
+    if not DATABASE_URL:
+        print("DATABASE_URL не задан - настройки хранятся в файле и пропадут при деплое")
+        return
+    pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=1, max_size=3,
+        statement_cache_size=0, max_inactive_connection_lifetime=30,
+    )
+    async with pool.acquire() as con:
+        await con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        await con.execute("CREATE TABLE IF NOT EXISTS wins (user_id BIGINT PRIMARY KEY, day DATE NOT NULL, n INT NOT NULL)")
+        row = await con.fetchrow("SELECT value FROM settings WHERE key = 'settings'")
+        if row:
+            S.update(json.loads(row["value"]))
+        for r in await con.fetch("SELECT user_id, day, n FROM wins WHERE day = $1", date.today()):
+            wins[r["user_id"]] = (r["day"], r["n"])
+    print("База подключена")
+
+
+async def save_settings():
+    if pool:
+        try:
+            async with pool.acquire() as con:
+                await con.execute(
+                    "INSERT INTO settings (key, value) VALUES ('settings', $1) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    json.dumps(S),
+                )
+        except Exception as e:
+            print("Ошибка сохранения настроек:", e)
+        return
     try:
         json.dump(S, open(SETTINGS_FILE, "w"))
     except Exception:
         pass
+
+
+async def save_win(uid: int):
+    if not pool:
+        return
+    d, n = wins[uid]
+    try:
+        async with pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO wins (user_id, day, n) VALUES ($1, $2, $3) "
+                "ON CONFLICT (user_id) DO UPDATE SET day = EXCLUDED.day, n = EXCLUDED.n",
+                uid, d, n,
+            )
+    except Exception as e:
+        print("Ошибка сохранения победы:", e)
 
 
 # ===== Память =====
@@ -221,7 +273,7 @@ async def set_value(m: Message, state: FSMContext):
         await m.answer("Минимум не может быть больше максимума.")
         return
     S[key] = v
-    save_settings()
+    await save_settings()
     await state.clear()
     await m.answer("✅ Сохранено.")
     await show_settings(m)
@@ -307,7 +359,7 @@ async def addgift_cmd(m: Message):
         return
     item = pool_item(g)
     S["custom_gifts"] = [c for c in S["custom_gifts"] if str(c["id"]) != gid] + [item]
-    save_settings()
+    await save_settings()
     await m.answer(f"✅ Добавлен: {item['emoji']} за {item['stars']} ⭐ (ID {gid})\nТеперь он может выпасть в ивенте.")
 
 
@@ -319,7 +371,7 @@ async def delgift_cmd(m: Message):
         return
     before = len(S["custom_gifts"])
     S["custom_gifts"] = [c for c in S["custom_gifts"] if str(c["id"]) != parts[1]]
-    save_settings()
+    await save_settings()
     await m.answer("🗑 Убран." if len(S["custom_gifts"]) < before else "Такого добавленного подарка нет.")
 
 
@@ -560,6 +612,7 @@ async def finish_event(cid: int, l: dict):
                 await bot.send_gift(user_id=uid, gift_id=g["id"])
             balance_now -= g["stars"]
             wins[uid] = (date.today(), wins_today(uid) + 1)
+            await save_win(uid)
             won.append((ev["names"][uid], g))
             await congratulate(uid, g, l["title"])
         except Exception as e:
@@ -595,6 +648,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await init_db()
     await dp.start_polling(bot)
 
 
