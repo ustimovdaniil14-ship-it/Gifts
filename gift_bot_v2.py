@@ -523,9 +523,13 @@ async def go_cb(c: CallbackQuery):
     if cid in events:
         await c.answer("В чате уже идёт ивент", show_alert=True)
         return
-    events[cid] = {"counts": {}, "names": {}, "last": {}}
-    last_event[cid] = time.time()
     l["admin_id"] = c.from_user.id
+    events[cid] = {
+        "counts": {}, "names": {}, "last": {}, "l": l,
+        "rolled": set(), "given": 0, "won": [], "failed": [], "no_money": False,
+        "gifts": await load_pool(),
+    }
+    last_event[cid] = time.time()
     try:
         await bot.send_message(
             cid,
@@ -534,7 +538,7 @@ async def go_cb(c: CallbackQuery):
             f"💬 Пиши и активничай в чате, чтобы получить награду!\n"
             f"🎁 Приз: подарок на {S['min_stars']}–{S['max_stars']} ⭐\n"
             f"⏳ Ивент идёт {l['minutes']} мин\n"
-            f"📝 Нужно минимум {S['min_msgs']} сообщений, чем активнее, тем выше шанс!\n\n"
+            f"📝 Нужно минимум {S['min_msgs']} сообщений. Подарки падают сразу, прямо во время ивента!\n\n"
             f"Удачи! 🍀",
         )
     except Exception as e:
@@ -547,21 +551,7 @@ async def go_cb(c: CallbackQuery):
     asyncio.create_task(finish_event(cid, l))
 
 
-# ===== Подсчёт активности (регистрируется после команд) =====
-@dp.message(GROUP, F.from_user, ~F.from_user.is_bot)
-async def count_msg(m: Message):
-    ev = events.get(m.chat.id)
-    uid = m.from_user.id
-    if not ev or uid in ADMINS:
-        return
-    now = time.time()
-    if now - ev["last"].get(uid, 0) < 5:  # антифлуд: считаем не чаще раза в 5 сек
-        return
-    ev["last"][uid] = now
-    ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
-    ev["names"][uid] = who(m.from_user)
-
-
+# ===== Подсчёт активности и выдача подарков прямо во время ивента =====
 def wins_today(uid: int) -> int:
     d, n = wins.get(uid, (None, 0))
     return n if d == date.today() else 0
@@ -578,62 +568,76 @@ async def congratulate(uid: int, g: dict, title: str):
         pass  # человек не запускал бота, напишем только в чате
 
 
+async def try_award(cid: int, uid: int, ev: dict):
+    """Человек набрал нужное число сообщений: один раз бросаем шанс и сразу дарим подарок."""
+    l = ev["l"]
+    if uid in ev["rolled"] or ev["given"] >= l["winners"] or wins_today(uid) >= S["daily_limit"]:
+        return
+    ev["rolled"].add(uid)  # помечаем до первого await, чтобы не бросить дважды
+    if random.random() * 100 >= l["chance"]:
+        return
+    ev["given"] += 1  # бронируем место приза
+    name = ev["names"].get(uid, str(uid))
+    free = l.get("mode") == "api"
+    balance_now = 10**9 if free else await get_balance()
+    suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= min(S["max_stars"], balance_now)]
+    if not suitable:
+        ev["given"] -= 1
+        ev["no_money"] = True
+        return
+    g = random.choice(suitable)
+    try:
+        if free:
+            await api_send_gift(uid, g["id"])
+        else:
+            await bot.send_gift(user_id=uid, gift_id=g["id"])
+    except Exception as e:
+        ev["given"] -= 1
+        ev["failed"].append((name, str(e)))
+        return
+    wins[uid] = (date.today(), wins_today(uid) + 1)
+    await save_win(uid)
+    ev["won"].append((name, g))
+    try:
+        await bot.send_message(cid, f"🎁 {name} получает {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)! Так держать 💙")
+    except Exception:
+        pass
+    await congratulate(uid, g, l["title"])
+
+
+@dp.message(GROUP, F.from_user, ~F.from_user.is_bot)
+async def count_msg(m: Message):
+    ev = events.get(m.chat.id)
+    uid = m.from_user.id
+    if not ev or uid in ADMINS:
+        return
+    now = time.time()
+    if now - ev["last"].get(uid, 0) < 5:  # антифлуд: считаем не чаще раза в 5 сек
+        return
+    ev["last"][uid] = now
+    ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
+    ev["names"][uid] = who(m.from_user)
+    if ev["counts"][uid] >= S["min_msgs"]:
+        asyncio.create_task(try_award(m.chat.id, uid, ev))
+
+
 async def finish_event(cid: int, l: dict):
     await asyncio.sleep(l["minutes"] * 60)
     ev = events.pop(cid, None)
     if not ev:
         return
 
-    eligible = [
-        u for u, n in ev["counts"].items()
-        if n >= S["min_msgs"] and wins_today(u) < S["daily_limit"]
-    ]
-    if not eligible:
-        await bot.send_message(cid, "⌛ Ивент закончился. Никто не набрал нужную активность 😢")
-        return
-
-    free = l.get("mode") == "api"
-    balance_now = 10**9 if free else await get_balance()
-    gifts = await load_pool()
-
-    won, failed, no_money = [], [], False
-    pool = eligible[:]
-    for _ in range(l["winners"]):
-        if not pool:
-            break
-        if random.random() * 100 >= l["chance"]:
-            continue
-        uid = random.choices(pool, weights=[min(ev["counts"][u], 20) for u in pool])[0]
-        pool.remove(uid)
-        suitable = [g for g in gifts if S["min_stars"] <= g["stars"] <= min(S["max_stars"], balance_now)]
-        if not suitable:
-            no_money = True
-            break
-        g = random.choice(suitable)
-        try:
-            if free:
-                await api_send_gift(uid, g["id"])
-            else:
-                await bot.send_gift(user_id=uid, gift_id=g["id"])
-            balance_now -= g["stars"]
-            wins[uid] = (date.today(), wins_today(uid) + 1)
-            await save_win(uid)
-            won.append((ev["names"][uid], g))
-            await congratulate(uid, g, l["title"])
-        except Exception as e:
-            failed.append((ev["names"][uid], str(e)))
-
-    if won:
-        lines = "\n".join(f"🎁 {n} получает {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)" for n, g in won)
-        await bot.send_message(cid, f"🏁 Ивент завершён!\n\nПодарки получают:\n{lines}\n\nСпасибо всем за активность! 💙")
+    if ev["won"]:
+        lines = "\n".join(f"🎁 {n} — {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)" for n, g in ev["won"])
+        await bot.send_message(cid, f"🏁 Ивент завершён!\n\nПодарки получили:\n{lines}\n\nСпасибо всем за активность! 💙")
     else:
-        await bot.send_message(cid, "🏁 Ивент завершён. В этот раз подарок не выпал 😔 Следующий ивент будет скоро!")
+        await bot.send_message(cid, "🏁 Ивент завершён. В этот раз подарок никому не достался 😔 Следующий ивент будет скоро!")
 
     # отчёт админу в личку
     report = []
-    if no_money:
+    if ev["no_money"]:
         report.append("⚠️ Подарок выпал, но нет подходящего подарка или не хватило звёзд. Пополни: /topup или проверь /gifts")
-    for n, err in failed:
+    for n, err in ev["failed"]:
         report.append(f"⚠️ Не удалось отправить {n}: {err}\n(человек должен хотя бы раз запустить бота в личке)")
     if report:
         try:
