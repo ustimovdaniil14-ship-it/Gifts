@@ -152,11 +152,27 @@ def menu_kb():
     ])
 
 
+async def raw_api(method: str, **params) -> dict:
+    """Прямой вызов метода твоего API без проверки aiogram (формат ответов у сервера урезанный)."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+        async with sess.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", json=params) as r:
+            return await r.json(content_type=None)
+
+
 async def get_balance() -> int:
     try:
-        return (await bot.get_my_star_balance()).amount
-    except Exception:
-        return 0
+        data = await raw_api("getMyStarBalance")
+        print("getMyStarBalance:", data)  # смотри в логах Render, что реально отвечает сервер
+        res = data.get("result", data)
+        if isinstance(res, dict):
+            for k in ("amount", "balance", "stars", "star_count"):
+                if k in res:
+                    return int(res[k])
+        elif isinstance(res, (int, float)):
+            return int(res)
+    except Exception as e:
+        print("Ошибка getMyStarBalance:", e)
+    return 0
 
 
 def who(u) -> str:
