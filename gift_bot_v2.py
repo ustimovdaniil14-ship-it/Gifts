@@ -8,6 +8,8 @@ from datetime import date
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,7 +27,12 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 FREE_API_URL = os.environ.get("FREE_API_URL", "").rstrip("/")  # адрес твоего API для бесплатной отправки
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x}
 
-bot = Bot(BOT_TOKEN)
+# Адрес не-оригинального Telegram API (свой сервер). Пусто или "official" = обычный Telegram.
+TG_API_URL = os.environ.get("TG_API_URL", "http://31.77.10.54:18081").rstrip("/")
+if TG_API_URL and TG_API_URL.lower() != "official":
+    bot = Bot(BOT_TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(TG_API_URL)))
+else:
+    bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # ===== Настройки (меняются из бота через /settings) =====
