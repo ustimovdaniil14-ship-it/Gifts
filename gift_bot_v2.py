@@ -6,6 +6,7 @@ import time
 from datetime import date
 
 import aiohttp
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -20,19 +21,17 @@ from aiogram.types import (
     LabeledPrice,
     Message,
     PreCheckoutQuery,
+    User,
 )
 
 # ===== Переменные окружения (задаются на Render) =====
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # строка подключения из Neon
 FREE_API_URL = os.environ.get("FREE_API_URL", "").rstrip("/")  # адрес твоего API для бесплатной отправки
+API_URL = os.environ.get("API_URL", "http://31.77.10.54:18081").rstrip("/")  # адрес не-оригинального Bot API
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x}
 
-# Адрес не-оригинального Telegram API (свой сервер). Пусто или "official" = обычный Telegram.
-TG_API_URL = os.environ.get("TG_API_URL", "http://31.77.10.54:18081").rstrip("/")
-if TG_API_URL and TG_API_URL.lower() != "official":
-    bot = Bot(BOT_TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(TG_API_URL)))
-else:
-    bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(API_URL)))
 dp = Dispatcher()
 
 # ===== Настройки (меняются из бота через /settings) =====
@@ -52,11 +51,61 @@ LABELS = {
 }
 
 
-def save_settings():
+pool = None  # пул подключений к Neon (если задан DATABASE_URL)
+
+
+async def init_db():
+    """Подключаемся к Neon, создаём таблицы, подтягиваем настройки и сегодняшние победы."""
+    global pool
+    if not DATABASE_URL:
+        print("DATABASE_URL не задан - настройки хранятся в файле и пропадут при деплое")
+        return
+    pool = await asyncpg.create_pool(
+        DATABASE_URL, min_size=1, max_size=3,
+        statement_cache_size=0, max_inactive_connection_lifetime=30,
+    )
+    async with pool.acquire() as con:
+        await con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        await con.execute("CREATE TABLE IF NOT EXISTS wins (user_id BIGINT PRIMARY KEY, day DATE NOT NULL, n INT NOT NULL)")
+        row = await con.fetchrow("SELECT value FROM settings WHERE key = 'settings'")
+        if row:
+            S.update(json.loads(row["value"]))
+        for r in await con.fetch("SELECT user_id, day, n FROM wins WHERE day = $1", date.today()):
+            wins[r["user_id"]] = (r["day"], r["n"])
+    print("База подключена")
+
+
+async def save_settings():
+    if pool:
+        try:
+            async with pool.acquire() as con:
+                await con.execute(
+                    "INSERT INTO settings (key, value) VALUES ('settings', $1) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    json.dumps(S),
+                )
+        except Exception as e:
+            print("Ошибка сохранения настроек:", e)
+        return
     try:
         json.dump(S, open(SETTINGS_FILE, "w"))
     except Exception:
         pass
+
+
+async def save_win(uid: int):
+    if not pool:
+        return
+    d, n = wins[uid]
+    try:
+        async with pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO wins (user_id, day, n) VALUES ($1, $2, $3) "
+                "ON CONFLICT (user_id) DO UPDATE SET day = EXCLUDED.day, n = EXCLUDED.n",
+                uid, d, n,
+            )
+    except Exception as e:
+        print("Ошибка сохранения победы:", e)
 
 
 # ===== Память =====
@@ -103,11 +152,27 @@ def menu_kb():
     ])
 
 
+async def raw_api(method: str, **params) -> dict:
+    """Прямой вызов метода твоего API без проверки aiogram (формат ответов у сервера урезанный)."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+        async with sess.post(f"{API_URL}/bot{BOT_TOKEN}/{method}", json=params) as r:
+            return await r.json(content_type=None)
+
+
 async def get_balance() -> int:
     try:
-        return (await bot.get_my_star_balance()).amount
-    except Exception:
-        return 0
+        data = await raw_api("getMyStarBalance")
+        print("getMyStarBalance:", data)  # смотри в логах Render, что реально отвечает сервер
+        res = data.get("result", data)
+        if isinstance(res, dict):
+            for k in ("amount", "balance", "stars", "star_count"):
+                if k in res:
+                    return int(res[k])
+        elif isinstance(res, (int, float)):
+            return int(res)
+    except Exception as e:
+        print("Ошибка getMyStarBalance:", e)
+    return 0
 
 
 def who(u) -> str:
@@ -228,7 +293,7 @@ async def set_value(m: Message, state: FSMContext):
         await m.answer("Минимум не может быть больше максимума.")
         return
     S[key] = v
-    save_settings()
+    await save_settings()
     await state.clear()
     await m.answer("✅ Сохранено.")
     await show_settings(m)
@@ -268,15 +333,16 @@ async def load_pool() -> list[dict]:
 
 
 async def api_send_gift(user_id: int, gift_id: str):
-    """БЕСПЛАТНАЯ отправка через твой API.
-    !!! Путь и поля ниже - заглушка, подстрой под свой API (пришли мне его описание). """
-    if not FREE_API_URL:
-        raise RuntimeError("не задан FREE_API_URL")
+    """Отправка подарка напрямую методом sendGift твоего API (без проверки баланса в боте)."""
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.post(f"{FREE_API_URL}/send_gift", json={"user_id": user_id, "gift_id": gift_id}) as r:
-            if r.status != 200:
+        async with s.post(f"{API_URL}/bot{BOT_TOKEN}/sendGift", json={"user_id": user_id, "gift_id": gift_id}) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
                 raise RuntimeError(f"API {r.status}: {(await r.text())[:200]}")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or str(data)[:200])
 
 
 @dp.message(Command("gifts"), PRIVATE, ADMIN)
@@ -297,25 +363,41 @@ async def gifts_cmd(m: Message):
     await m.answer(text + "\n".join(lines)[:3800] + "\n\nДобавить: /addgift ID")
 
 
+@dp.message(Command("probe"), PRIVATE, ADMIN)
+async def probe_cmd(m: Message):
+    """Проверяет, какой метод твоего API отдаёт список подарков с их ID."""
+    out = []
+    for name in ("getAvailableGifts", "getGifts", "getStarGifts", "getGiftList", "getAllGifts", "gifts", "getUserGifts"):
+        try:
+            data = await raw_api(name)
+            out.append(f"{name}: {json.dumps(data, ensure_ascii=False)[:300]}")
+        except Exception as e:
+            out.append(f"{name}: ошибка {e}")
+    await m.answer("\n\n".join(out)[:3800])
+
+
 @dp.message(Command("addgift"), PRIVATE, ADMIN)
 async def addgift_cmd(m: Message):
     parts = m.text.split()
     if len(parts) < 2:
-        await m.answer("Напиши так: /addgift ID_подарка\nСписок ID: /gifts")
+        await m.answer("Напиши так: /addgift ID ЗВЁЗДЫ [эмодзи]\nНапример: /addgift 5170233102089322756 50 🧸")
         return
     gid = parts[1]
+    item = None
     try:
         gifts = (await bot.get_available_gifts()).gifts
-    except Exception as e:
-        await m.answer(f"Не получилось загрузить список подарков: {e}")
-        return
-    g = next((x for x in gifts if str(x.id) == gid), None)
-    if not g:
-        await m.answer("Такого ID нет среди доступных подарков Telegram. Проверь ID в /gifts")
-        return
-    item = pool_item(g)
+        g = next((x for x in gifts if str(x.id) == gid), None)
+        if g:
+            item = pool_item(g)
+    except Exception:
+        pass  # на твоём API getAvailableGifts может не быть - тогда вручную
+    if not item:
+        if len(parts) < 3 or not parts[2].isdigit():
+            await m.answer("Список подарков недоступен, укажи цену сам:\n/addgift ID ЗВЁЗДЫ [эмодзи]")
+            return
+        item = {"id": gid, "stars": int(parts[2]), "emoji": parts[3] if len(parts) > 3 else "🎁"}
     S["custom_gifts"] = [c for c in S["custom_gifts"] if str(c["id"]) != gid] + [item]
-    save_settings()
+    await save_settings()
     await m.answer(f"✅ Добавлен: {item['emoji']} за {item['stars']} ⭐ (ID {gid})\nТеперь он может выпасть в ивенте.")
 
 
@@ -327,7 +409,7 @@ async def delgift_cmd(m: Message):
         return
     before = len(S["custom_gifts"])
     S["custom_gifts"] = [c for c in S["custom_gifts"] if str(c["id"]) != parts[1]]
-    save_settings()
+    await save_settings()
     await m.answer("🗑 Убран." if len(S["custom_gifts"]) < before else "Такого добавленного подарка нет.")
 
 
@@ -439,9 +521,6 @@ async def mode_cb(c: CallbackQuery):
         await c.answer("Сессия устарела", show_alert=True)
         return
     l["mode"] = c.data[3:]
-    if l["mode"] == "api" and not FREE_API_URL:
-        await c.answer("FREE_API_URL не задан в переменных Render", show_alert=True)
-        return
     kb = Kb(inline_keyboard=[[Btn(text="🚀 Запустить", callback_data="go"), Btn(text="❌ Отмена", callback_data="stop")]])
     await c.message.answer(
         f"Проверь настройки:\n\n"
@@ -474,9 +553,13 @@ async def go_cb(c: CallbackQuery):
     if cid in events:
         await c.answer("В чате уже идёт ивент", show_alert=True)
         return
-    events[cid] = {"counts": {}, "names": {}, "last": {}}
-    last_event[cid] = time.time()
     l["admin_id"] = c.from_user.id
+    events[cid] = {
+        "counts": {}, "names": {}, "last": {}, "l": l,
+        "rolled": set(), "given": 0, "won": [], "failed": [], "no_money": False,
+        "gifts": await load_pool(),
+    }
+    last_event[cid] = time.time()
     try:
         await bot.send_message(
             cid,
@@ -485,7 +568,7 @@ async def go_cb(c: CallbackQuery):
             f"💬 Пиши и активничай в чате, чтобы получить награду!\n"
             f"🎁 Приз: подарок на {S['min_stars']}–{S['max_stars']} ⭐\n"
             f"⏳ Ивент идёт {l['minutes']} мин\n"
-            f"📝 Нужно минимум {S['min_msgs']} сообщений, чем активнее, тем выше шанс!\n\n"
+            f"📝 Нужно минимум {S['min_msgs']} сообщений. Подарки падают сразу, прямо во время ивента!\n\n"
             f"Удачи! 🍀",
         )
     except Exception as e:
@@ -498,17 +581,7 @@ async def go_cb(c: CallbackQuery):
     asyncio.create_task(finish_event(cid, l))
 
 
-# ===== Подсчёт активности (регистрируется после команд) =====
-@dp.message(GROUP, F.from_user, ~F.from_user.is_bot)
-async def count_msg(m: Message):
-    ev = events.get(m.chat.id)
-    uid = m.from_user.id
-    if not ev:
-        return
-    ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
-    ev["names"][uid] = who(m.from_user)
-
-
+# ===== Подсчёт активности и выдача подарков прямо во время ивента =====
 def wins_today(uid: int) -> int:
     d, n = wins.get(uid, (None, 0))
     return n if d == date.today() else 0
@@ -525,61 +598,72 @@ async def congratulate(uid: int, g: dict, title: str):
         pass  # человек не запускал бота, напишем только в чате
 
 
+async def try_award(cid: int, uid: int, ev: dict):
+    """Человек набрал нужное число сообщений: один раз бросаем шанс и сразу дарим подарок."""
+    l = ev["l"]
+    if uid in ev["rolled"] or ev["given"] >= l["winners"] or wins_today(uid) >= S["daily_limit"]:
+        return
+    ev["rolled"].add(uid)  # помечаем до первого await, чтобы не бросить дважды
+    if random.random() * 100 >= l["chance"]:
+        return
+    ev["given"] += 1  # бронируем место приза
+    name = ev["names"].get(uid, str(uid))
+    free = l.get("mode") == "api"
+    balance_now = 10**9 if free else await get_balance()
+    suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= min(S["max_stars"], balance_now)]
+    if not suitable:
+        ev["given"] -= 1
+        ev["no_money"] = True
+        return
+    g = random.choice(suitable)
+    try:
+        if free:
+            await api_send_gift(uid, g["id"])
+        else:
+            await bot.send_gift(user_id=uid, gift_id=g["id"])
+    except Exception as e:
+        ev["given"] -= 1
+        ev["failed"].append((name, str(e)))
+        return
+    wins[uid] = (date.today(), wins_today(uid) + 1)
+    await save_win(uid)
+    ev["won"].append((name, g))
+    try:
+        await bot.send_message(cid, f"🎁 {name} получает {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)! Так держать 💙")
+    except Exception:
+        pass
+    await congratulate(uid, g, l["title"])
+
+
+@dp.message(GROUP, F.from_user, ~F.from_user.is_bot)
+async def count_msg(m: Message):
+    ev = events.get(m.chat.id)
+    uid = m.from_user.id
+    if not ev:
+        return
+    ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
+    ev["names"][uid] = who(m.from_user)
+    if ev["counts"][uid] >= S["min_msgs"]:
+        asyncio.create_task(try_award(m.chat.id, uid, ev))
+
+
 async def finish_event(cid: int, l: dict):
     await asyncio.sleep(l["minutes"] * 60)
     ev = events.pop(cid, None)
     if not ev:
         return
 
-    eligible = [
-        u for u, n in ev["counts"].items()
-        if n >= S["min_msgs"] and wins_today(u) < S["daily_limit"]
-    ]
-    if not eligible:
-        await bot.send_message(cid, "⌛ Ивент закончился. Никто не набрал нужную активность 😢")
-        return
-
-    free = l.get("mode") == "api"
-    balance_now = 10**9 if free else await get_balance()
-    gifts = await load_pool()
-
-    won, failed, no_money = [], [], False
-    pool = eligible[:]
-    for _ in range(l["winners"]):
-        if not pool:
-            break
-        if random.random() * 100 >= l["chance"]:
-            continue
-        uid = random.choices(pool, weights=[min(ev["counts"][u], 20) for u in pool])[0]
-        pool.remove(uid)
-        suitable = [g for g in gifts if S["min_stars"] <= g["stars"] <= min(S["max_stars"], balance_now)]
-        if not suitable:
-            no_money = True
-            break
-        g = random.choice(suitable)
-        try:
-            if free:
-                await api_send_gift(uid, g["id"])
-            else:
-                await bot.send_gift(user_id=uid, gift_id=g["id"])
-            balance_now -= g["stars"]
-            wins[uid] = (date.today(), wins_today(uid) + 1)
-            won.append((ev["names"][uid], g))
-            await congratulate(uid, g, l["title"])
-        except Exception as e:
-            failed.append((ev["names"][uid], str(e)))
-
-    if won:
-        lines = "\n".join(f"🎁 {n} получает {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)" for n, g in won)
-        await bot.send_message(cid, f"🏁 Ивент завершён!\n\nПодарки получают:\n{lines}\n\nСпасибо всем за активность! 💙")
+    if ev["won"]:
+        lines = "\n".join(f"🎁 {n} — {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)" for n, g in ev["won"])
+        await bot.send_message(cid, f"🏁 Ивент завершён!\n\nПодарки получили:\n{lines}\n\nСпасибо всем за активность! 💙")
     else:
-        await bot.send_message(cid, "🏁 Ивент завершён. В этот раз подарок не выпал 😔 Следующий ивент будет скоро!")
+        await bot.send_message(cid, "🏁 Ивент завершён. В этот раз подарок никому не достался 😔 Следующий ивент будет скоро!")
 
     # отчёт админу в личку
     report = []
-    if no_money:
+    if ev["no_money"]:
         report.append("⚠️ Подарок выпал, но нет подходящего подарка или не хватило звёзд. Пополни: /topup или проверь /gifts")
-    for n, err in failed:
+    for n, err in ev["failed"]:
         report.append(f"⚠️ Не удалось отправить {n}: {err}\n(человек должен хотя бы раз запустить бота в личке)")
     if report:
         try:
@@ -593,12 +677,26 @@ async def health(_):
     return web.Response(text="ok")
 
 
+async def init_me():
+    """Твой API отдаёт getMe урезанным (без новых полей), и aiogram падает на проверке.
+    Берём getMe сами и кладём в кэш бота, чтобы aiogram не делал свой запрос."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+        async with s.get(f"{API_URL}/bot{BOT_TOKEN}/getMe") as r:
+            data = await r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"getMe не прошёл: {data}")
+    bot._me = User(**data["result"])
+    print("Бот:", bot._me.username)
+
+
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await init_me()
+    await init_db()
     await dp.start_polling(bot)
 
 
