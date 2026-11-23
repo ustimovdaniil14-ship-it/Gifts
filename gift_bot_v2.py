@@ -311,6 +311,27 @@ def gift_word(g: dict) -> str:
     return EMOJI_NAMES.get(g["emoji"], "подарок")
 
 
+async def raw_gifts() -> list:
+    """Список подарков напрямую из твоего API (aiogram не принимает урезанный ответ сервера)."""
+    from types import SimpleNamespace as NS
+    data = await raw_api("getAvailableGifts")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or str(data)[:200])
+    res = data.get("result", {})
+    items = res.get("gifts", []) if isinstance(res, dict) else res
+    out = []
+    for g in items:
+        st = g.get("sticker") or {}
+        out.append(NS(
+            id=str(g["id"]),
+            star_count=int(g.get("star_count", 0)),
+            total_count=g.get("total_count"),
+            remaining_count=g.get("remaining_count"),
+            sticker=NS(emoji=st.get("emoji") or "🎁"),
+        ))
+    return out
+
+
 def pool_item(g) -> dict:
     st = getattr(g, "sticker", None)
     return {"id": str(g.id), "stars": g.star_count, "emoji": getattr(st, "emoji", None) or "🎁"}
@@ -320,9 +341,11 @@ async def load_pool() -> list[dict]:
     """Обычные подарки Telegram + те, что ты добавил через /addgift."""
     items: dict[str, dict] = {}
     try:
-        gifts = (await bot.get_available_gifts()).gifts
-    except Exception:
+        gifts = (await raw_gifts())
+    except Exception as e:
+        print("Ошибка загрузки подарков:", e)
         gifts = []
+    print("Подарков из API:", len(gifts))
     for g in gifts:
         if getattr(g, "remaining_count", None) == 0:  # лимитка распродана
             continue
@@ -348,7 +371,7 @@ async def api_send_gift(user_id: int, gift_id: str):
 @dp.message(Command("gifts"), PRIVATE, ADMIN)
 async def gifts_cmd(m: Message):
     try:
-        gifts = (await bot.get_available_gifts()).gifts
+        gifts = (await raw_gifts())
     except Exception as e:
         await m.answer(f"Не получилось загрузить список: {e}")
         return
@@ -385,7 +408,7 @@ async def addgift_cmd(m: Message):
     gid = parts[1]
     item = None
     try:
-        gifts = (await bot.get_available_gifts()).gifts
+        gifts = (await raw_gifts())
         g = next((x for x in gifts if str(x.id) == gid), None)
         if g:
             item = pool_item(g)
@@ -620,7 +643,7 @@ async def try_award(cid: int, uid: int, ev: dict):
         if free:
             await api_send_gift(uid, g["id"])
         else:
-            await bot.send_gift(user_id=uid, gift_id=g["id"])
+            await api_send_gift(uid, g["id"])
     except Exception as e:
         ev["given"] -= 1
         ev["failed"].append((name, str(e)))
