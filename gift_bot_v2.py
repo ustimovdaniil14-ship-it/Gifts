@@ -21,6 +21,7 @@ from aiogram.types import (
     LabeledPrice,
     Message,
     PreCheckoutQuery,
+    User,
 )
 
 # ===== Переменные окружения (задаются на Render) =====
@@ -645,12 +646,25 @@ async def health(_):
     return web.Response(text="ok")
 
 
+async def init_me():
+    """Твой API отдаёт getMe урезанным (без новых полей), и aiogram падает на проверке.
+    Берём getMe сами и кладём в кэш бота, чтобы aiogram не делал свой запрос."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+        async with s.get(f"{API_URL}/bot{BOT_TOKEN}/getMe") as r:
+            data = await r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"getMe не прошёл: {data}")
+    bot._me = User(**data["result"])
+    print("Бот:", bot._me.username)
+
+
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+    await init_me()
     await init_db()
     await dp.start_polling(bot)
 
