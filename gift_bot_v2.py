@@ -47,7 +47,6 @@ LABELS = {
     "min_stars": "Мин. цена гифта (⭐)",
     "max_stars": "Макс. цена гифта (⭐)",
     "min_msgs": "Мин. сообщений в чате для участия",
-    "cooldown_min": "Пауза между ивентами в чате (мин)",
     "daily_limit": "Макс. подарков одному человеку в сутки",
 }
 
@@ -133,7 +132,7 @@ HELP = (
     "В личке с ботом (только админы):\n"
     "/start — главное меню\n"
     "/help — список команд\n"
-    "/settings — настройки (цена гифтов, мин. сообщений, пауза, лимиты)\n"
+    "/settings — настройки (цена гифтов, мин. сообщений, лимиты)\n"
     "/balance — баланс бота в звёздах\n"
     "/gifts — список подарков Telegram с их ID\n"
     "/addgift ID — добавить подарок в розыгрыш по ID\n"
@@ -539,10 +538,6 @@ async def event_cmd(m: Message):
     cid = m.chat.id
     if cid in events:
         await m.reply("Ивент уже идёт ⏳")
-        return
-    left = last_event.get(cid, 0) + S["cooldown_min"] * 60 - time.time()
-    if left > 0:
-        await m.reply(f"Рано! Подожди ещё ~{int(left // 60) + 1} мин. Так подарки не падают слишком часто.")
         return
     launches[m.from_user.id] = {"chat_id": cid, "title": m.chat.title, "admin": who(m.from_user)}
     kb = Kb(inline_keyboard=[
