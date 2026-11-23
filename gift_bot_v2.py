@@ -316,15 +316,16 @@ async def load_pool() -> list[dict]:
 
 
 async def api_send_gift(user_id: int, gift_id: str):
-    """БЕСПЛАТНАЯ отправка через твой API.
-    !!! Путь и поля ниже - заглушка, подстрой под свой API (пришли мне его описание). """
-    if not FREE_API_URL:
-        raise RuntimeError("не задан FREE_API_URL")
+    """Отправка подарка напрямую методом sendGift твоего API (без проверки баланса в боте)."""
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.post(f"{FREE_API_URL}/send_gift", json={"user_id": user_id, "gift_id": gift_id}) as r:
-            if r.status != 200:
+        async with s.post(f"{API_URL}/bot{BOT_TOKEN}/sendGift", json={"user_id": user_id, "gift_id": gift_id}) as r:
+            try:
+                data = await r.json(content_type=None)
+            except Exception:
                 raise RuntimeError(f"API {r.status}: {(await r.text())[:200]}")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or str(data)[:200])
 
 
 @dp.message(Command("gifts"), PRIVATE, ADMIN)
@@ -349,19 +350,22 @@ async def gifts_cmd(m: Message):
 async def addgift_cmd(m: Message):
     parts = m.text.split()
     if len(parts) < 2:
-        await m.answer("Напиши так: /addgift ID_подарка\nСписок ID: /gifts")
+        await m.answer("Напиши так: /addgift ID ЗВЁЗДЫ [эмодзи]\nНапример: /addgift 5170233102089322756 50 🧸")
         return
     gid = parts[1]
+    item = None
     try:
         gifts = (await bot.get_available_gifts()).gifts
-    except Exception as e:
-        await m.answer(f"Не получилось загрузить список подарков: {e}")
-        return
-    g = next((x for x in gifts if str(x.id) == gid), None)
-    if not g:
-        await m.answer("Такого ID нет среди доступных подарков Telegram. Проверь ID в /gifts")
-        return
-    item = pool_item(g)
+        g = next((x for x in gifts if str(x.id) == gid), None)
+        if g:
+            item = pool_item(g)
+    except Exception:
+        pass  # на твоём API getAvailableGifts может не быть - тогда вручную
+    if not item:
+        if len(parts) < 3 or not parts[2].isdigit():
+            await m.answer("Список подарков недоступен, укажи цену сам:\n/addgift ID ЗВЁЗДЫ [эмодзи]")
+            return
+        item = {"id": gid, "stars": int(parts[2]), "emoji": parts[3] if len(parts) > 3 else "🎁"}
     S["custom_gifts"] = [c for c in S["custom_gifts"] if str(c["id"]) != gid] + [item]
     await save_settings()
     await m.answer(f"✅ Добавлен: {item['emoji']} за {item['stars']} ⭐ (ID {gid})\nТеперь он может выпасть в ивенте.")
@@ -487,9 +491,6 @@ async def mode_cb(c: CallbackQuery):
         await c.answer("Сессия устарела", show_alert=True)
         return
     l["mode"] = c.data[3:]
-    if l["mode"] == "api" and not FREE_API_URL:
-        await c.answer("FREE_API_URL не задан в переменных Render", show_alert=True)
-        return
     kb = Kb(inline_keyboard=[[Btn(text="🚀 Запустить", callback_data="go"), Btn(text="❌ Отмена", callback_data="stop")]])
     await c.message.answer(
         f"Проверь настройки:\n\n"
