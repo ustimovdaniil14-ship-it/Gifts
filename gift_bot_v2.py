@@ -44,8 +44,8 @@ except Exception:
     pass
 
 LABELS = {
-    "min_stars": "Мин. цена гифта (⭐, не меньше 15)",
-    "max_stars": "Макс. цена гифта (⭐, не больше 100)",
+    "min_stars": "Мин. цена гифта (⭐)",
+    "max_stars": "Макс. цена гифта (⭐)",
     "min_msgs": "Мин. сообщений в чате для участия",
     "cooldown_min": "Пауза между ивентами в чате (мин)",
     "daily_limit": "Макс. подарков одному человеку в сутки",
@@ -288,8 +288,8 @@ async def set_value(m: Message, state: FSMContext):
         await m.answer("Нужно целое число больше нуля.")
         return
     v = int(m.text)
-    if key in ("min_stars", "max_stars") and not 15 <= v <= 100:
-        await m.answer("Для гифтов подходит диапазон 15–100 звёзд.")
+    if key in ("min_stars", "max_stars") and not 1 <= v <= 100000:
+        await m.answer("Цена гифта: от 1 до 100000 звёзд.")
         return
     new = {**S, key: v}
     if new["min_stars"] > new["max_stars"]:
