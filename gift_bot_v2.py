@@ -125,6 +125,8 @@ class Edit(StatesGroup):
 
 class Custom(StatesGroup):
     chance = State()
+    minutes = State()
+    winners = State()
 
 
 HELP = (
@@ -593,38 +595,92 @@ async def custom_chance(m: Message, state: FSMContext):
 
 
 async def ask_duration(msg: Message):
-    kb = Kb(inline_keyboard=[[Btn(text=f"{n} мин", callback_data=f"du:{n}") for n in (1, 3, 5, 10, 15)]])
+    kb = Kb(inline_keyboard=[
+        [Btn(text=f"{n} мин", callback_data=f"du:{n}") for n in (1, 3, 5, 10, 15)],
+        [Btn(text="✍️ Своё число", callback_data="du:custom")],
+    ])
     await msg.answer("⏳ Сколько минут будет идти ивент? (люди пишут в чате и копят активность)", reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("du:"), ADMIN)
-async def duration_cb(c: CallbackQuery):
-    l = need_launch(c)
-    if not l:
-        await c.answer("Сессия устарела", show_alert=True)
-        return
-    l["minutes"] = int(c.data[3:])
-    kb = Kb(inline_keyboard=[[Btn(text=f"{n}", callback_data=f"wn:{n}") for n in (1, 2, 3, 5)]])
-    await c.message.answer(
-        "🏆 Сколько подарков может упасть максимум?\n(шанс бросается отдельно на каждый подарок)",
+async def ask_winners(msg: Message):
+    kb = Kb(inline_keyboard=[
+        [Btn(text=f"{n}", callback_data=f"wn:{n}") for n in (1, 3, 5, 10, 20)],
+        [Btn(text="✍️ Своё число", callback_data="wn:custom")],
+    ])
+    await msg.answer(
+        "🏆 Сколько подарков может упасть максимум?\n(шанс бросается отдельно на каждый подарок, падают они в случайные моменты ивента)",
         reply_markup=kb,
     )
-    await c.answer()
 
 
-@dp.callback_query(F.data.startswith("wn:"), ADMIN)
-async def winners_cb(c: CallbackQuery):
-    l = need_launch(c)
-    if not l:
-        await c.answer("Сессия устарела", show_alert=True)
-        return
-    l["winners"] = int(c.data[3:])
+async def ask_mode(msg: Message):
     mkb = Kb(inline_keyboard=[
         [Btn(text="💰 С баланса бота", callback_data="md:balance")],
         [Btn(text="🆓 Бесплатно через API", callback_data="md:api")],
     ])
-    await c.message.answer("💳 Откуда брать подарки?", reply_markup=mkb)
+    await msg.answer("💳 Откуда брать подарки?", reply_markup=mkb)
+
+
+@dp.callback_query(F.data.startswith("du:"), ADMIN)
+async def duration_cb(c: CallbackQuery, state: FSMContext):
+    l = need_launch(c)
+    if not l:
+        await c.answer("Сессия устарела", show_alert=True)
+        return
+    v = c.data[3:]
+    if v == "custom":
+        await state.set_state(Custom.minutes)
+        await c.message.answer("Напиши, сколько минут идёт ивент (от 1 до 1440)")
+    else:
+        l["minutes"] = int(v)
+        await ask_winners(c.message)
     await c.answer()
+
+
+@dp.message(StateFilter(Custom.minutes), PRIVATE, ADMIN)
+async def custom_minutes(m: Message, state: FSMContext):
+    l = launches.get(m.from_user.id)
+    if not l:
+        await state.clear()
+        await m.answer("Сессия устарела, напиши /event в чате заново.")
+        return
+    if not m.text or not m.text.isdigit() or not 1 <= int(m.text) <= 1440:
+        await m.answer("Нужно целое число минут от 1 до 1440.")
+        return
+    l["minutes"] = int(m.text)
+    await state.clear()
+    await ask_winners(m)
+
+
+@dp.callback_query(F.data.startswith("wn:"), ADMIN)
+async def winners_cb(c: CallbackQuery, state: FSMContext):
+    l = need_launch(c)
+    if not l:
+        await c.answer("Сессия устарела", show_alert=True)
+        return
+    v = c.data[3:]
+    if v == "custom":
+        await state.set_state(Custom.winners)
+        await c.message.answer("Напиши, сколько подарков может упасть максимум (от 1 до 1000)")
+    else:
+        l["winners"] = int(v)
+        await ask_mode(c.message)
+    await c.answer()
+
+
+@dp.message(StateFilter(Custom.winners), PRIVATE, ADMIN)
+async def custom_winners(m: Message, state: FSMContext):
+    l = launches.get(m.from_user.id)
+    if not l:
+        await state.clear()
+        await m.answer("Сессия устарела, напиши /event в чате заново.")
+        return
+    if not m.text or not m.text.isdigit() or not 1 <= int(m.text) <= 1000:
+        await m.answer("Нужно целое число подарков от 1 до 1000.")
+        return
+    l["winners"] = int(m.text)
+    await state.clear()
+    await ask_mode(m)
 
 
 @dp.callback_query(F.data.startswith("md:"), ADMIN)
@@ -681,7 +737,7 @@ async def go_cb(c: CallbackQuery):
             f"💬 Пиши и активничай в чате, чтобы получить награду!\n"
             f"🎁 Приз: подарок на {S['min_stars']}–{S['max_stars']} ⭐\n"
             f"⏳ Ивент идёт {l['minutes']} мин\n"
-            f"📝 Нужно минимум {S['min_msgs']} сообщений. Подарки падают сразу, прямо во время ивента!\n\n"
+            f"📝 Нужно минимум {S['min_msgs']} сообщений, чтобы участвовать. Дальше всё решает шанс, подарки падают в случайные моменты прямо во время ивента!\n\n"
             f"Удачи! 🍀",
         )
     except Exception as e:
@@ -692,6 +748,7 @@ async def go_cb(c: CallbackQuery):
     await c.message.answer("🚀 Ивент запущен!")
     await c.answer()
     asyncio.create_task(finish_event(cid, l))
+    asyncio.create_task(run_slots(cid, events[cid]))
 
 
 # ===== Подсчёт активности и выдача подарков прямо во время ивента =====
@@ -722,48 +779,66 @@ async def notify_admin(ev: dict, text: str):
         pass
 
 
-async def try_award(cid: int, uid: int, ev: dict):
-    """Человек набрал нужное число сообщений: один раз бросаем шанс и сразу дарим подарок."""
+async def award_one(cid: int, ev: dict) -> bool:
+    """Выдаёт один подарок случайному активному участнику (все участники равны).
+    True = место обработано, False = пока некому дарить (попробуем позже)."""
     l = ev["l"]
+    eligible = [
+        u for u, n in ev["counts"].items()
+        if n >= S["min_msgs"] and u not in ev["rolled"] and (u in ADMINS or wins_today(u) < S["daily_limit"])
+    ]
+    if not eligible:
+        return False
+    uid = random.choice(eligible)  # все равны, количество сообщений не влияет
+    ev["rolled"].add(uid)  # один подарок на человека за ивент
     name = ev["names"].get(uid, str(uid))
-    if uid in ev["rolled"] or ev["given"] >= l["winners"]:
-        return
-    if uid not in ADMINS and wins_today(uid) >= S["daily_limit"]:
-        ev["rolled"].add(uid)
-        await notify_admin(ev, f"ℹ️ {name} набрал сообщения, но уже получил лимит подарков за сегодня ({S['daily_limit']}).")
-        return
-    ev["rolled"].add(uid)  # помечаем до первого await, чтобы не бросить дважды
-    if random.random() * 100 >= l["chance"]:
-        await notify_admin(ev, f"🎲 {name}: шанс {l['chance']}% не выпал.")
-        return
-    ev["given"] += 1  # бронируем место приза
     suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= S["max_stars"]]
     if not suitable:
-        ev["given"] -= 1
+        ev["rolled"].discard(uid)
         ev["no_money"] = True
-        await notify_admin(ev, f"⚠️ {name}: нет подходящих подарков в диапазоне {S['min_stars']}–{S['max_stars']} ⭐ (всего в пуле: {len(ev['gifts'])}). Проверь /gifts и /settings.")
-        return
+        await notify_admin(ev, f"⚠️ Нет подходящих подарков в диапазоне {S['min_stars']}–{S['max_stars']} ⭐ (всего в пуле: {len(ev['gifts'])}). Проверь /gifts и /settings.")
+        return True
     g = random.choice(suitable)
     try:
         await api_send_gift(uid, g["id"])  # баланс проверяет сам сервер
     except Exception as e:
-        ev["given"] -= 1
         ev["failed"].append((name, str(e)))
         await notify_admin(ev, f"⚠️ Не удалось отправить подарок {name}: {e}")
-        return
+        return False  # этого человека пропускаем, пробуем другого
     wins[uid] = (date.today(), wins_today(uid) + 1)
     await save_win(uid)
     ev["won"].append((name, g))
+    ev["given"] += 1
     try:
         await bot.send_message(cid, f"🎁 {name} получает {g['emoji']} {gift_word(g)} ({g['stars']} ⭐)! Так держать 💙")
     except Exception:
         pass
     await congratulate(uid, g, l["title"])
+    return True
 
 
-async def safe_award(cid: int, uid: int, ev: dict):
+async def run_slots(cid: int, ev: dict):
+    """Шанс бросается отдельно на каждый подарок. Выпавшие подарки падают в случайные моменты ивента."""
     try:
-        await try_award(cid, uid, ev)
+        l = ev["l"]
+        total = l["minutes"] * 60
+        live = sum(1 for _ in range(l["winners"]) if random.random() * 100 < l["chance"])
+        ev["live"] = live
+        await notify_admin(ev, f"🎲 Шанс {l['chance']}%: из {l['winners']} подарков выпадет {live}.")
+        if not live:
+            return
+        start = time.time()
+        offsets = sorted(random.uniform(total * 0.05, total * 0.9) for _ in range(live))
+        for off in offsets:
+            wait = start + off - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            while events.get(cid) is ev:
+                if await award_one(cid, ev):
+                    break
+                await asyncio.sleep(5)  # некому дарить, ждём активности
+            if events.get(cid) is not ev:
+                return
     except Exception as e:
         await notify_admin(ev, f"❌ Ошибка выдачи: {e!r}")
 
@@ -777,8 +852,6 @@ async def count_msg(m: Message):
         return
     ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
     ev["names"][uid] = who(m.from_user)
-    if ev["counts"][uid] >= S["min_msgs"]:
-        asyncio.create_task(safe_award(m.chat.id, uid, ev))
 
 
 async def finish_event(cid: int, l: dict):
@@ -799,6 +872,8 @@ async def finish_event(cid: int, l: dict):
         report.append("⚠️ Подарок выпал, но нет подходящего подарка или не хватило звёзд. Пополни: /topup или проверь /gifts")
     for n, err in ev["failed"]:
         report.append(f"⚠️ Не удалось отправить {n}: {err}\n(человек должен хотя бы раз запустить бота в личке)")
+    if ev.get("live", 0) > len(ev["won"]) and not ev["failed"] and not ev["no_money"]:
+        report.append(f"ℹ️ Должно было выпасть {ev['live']}, выдано {len(ev['won'])}: не хватило участников, набравших {S['min_msgs']} сообщений.")
     if report:
         try:
             await bot.send_message(l["admin_id"], "\n\n".join(report))
