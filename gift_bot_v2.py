@@ -311,21 +311,30 @@ def gift_word(g: dict) -> str:
     return EMOJI_NAMES.get(g["emoji"], "подарок")
 
 
-def pool_item(g) -> dict:
-    st = getattr(g, "sticker", None)
-    return {"id": str(g.id), "stars": g.star_count, "emoji": getattr(st, "emoji", None) or "🎁"}
+async def fetch_gifts() -> list[dict]:
+    """Список подарков напрямую из API (aiogram не разбирает урезанные ответы сервера)."""
+    data = await raw_api("getAvailableGifts")
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or str(data)[:200])
+    return data["result"]["gifts"]
+
+
+def pool_item(g: dict) -> dict:
+    st = g.get("sticker") or {}
+    return {"id": str(g["id"]), "stars": int(g["star_count"]), "emoji": st.get("emoji") or "🎁"}
 
 
 async def load_pool() -> list[dict]:
-    """Обычные подарки Telegram + те, что ты добавил через /addgift."""
+    """Обычные подарки сервера + те, что ты добавил через /addgift."""
     items: dict[str, dict] = {}
     try:
-        gifts = (await bot.get_available_gifts()).gifts
-    except Exception:
+        gifts = await fetch_gifts()
+    except Exception as e:
+        print("Ошибка загрузки подарков:", e)
         gifts = []
     for g in gifts:
-        if getattr(g, "total_count", None) is None:  # лимитированные только через /addgift
-            items[str(g.id)] = pool_item(g)
+        if g.get("total_count") is None:  # лимитированные только через /addgift
+            items[str(g["id"])] = pool_item(g)
     for c in S["custom_gifts"]:
         items[str(c["id"])] = c
     return list(items.values())
@@ -347,17 +356,17 @@ async def api_send_gift(user_id: int, gift_id: str):
 @dp.message(Command("gifts"), PRIVATE, ADMIN)
 async def gifts_cmd(m: Message):
     try:
-        gifts = (await bot.get_available_gifts()).gifts
+        gifts = await fetch_gifts()
     except Exception as e:
         await m.answer(f"Не получилось загрузить список: {e}")
         return
     added = {str(c["id"]) for c in S["custom_gifts"]}
     lines = []
-    for g in sorted(gifts, key=lambda x: x.star_count):
+    for g in sorted(gifts, key=lambda x: x["star_count"]):
         it = pool_item(g)
-        lim = "" if getattr(g, "total_count", None) is None else " (лимитка)"
-        mark = " ➕" if str(g.id) in added else ""
-        lines.append(f"{it['emoji']} {g.star_count} ⭐{lim}{mark} — {g.id}")
+        lim = "" if g.get("total_count") is None else " (лимитка)"
+        mark = " ➕" if it["id"] in added else ""
+        lines.append(f"{it['emoji']} {it['stars']} ⭐{lim}{mark} — {it['id']}")
     text = "🎁 Доступные подарки (➕ = добавлен тобой)\nОбычные участвуют сами, лимитки добавляй через /addgift\n\n"
     await m.answer(text + "\n".join(lines)[:3800] + "\n\nДобавить: /addgift ID")
 
@@ -384,8 +393,8 @@ async def addgift_cmd(m: Message):
     gid = parts[1]
     item = None
     try:
-        gifts = (await bot.get_available_gifts()).gifts
-        g = next((x for x in gifts if str(x.id) == gid), None)
+        gifts = await fetch_gifts()
+        g = next((x for x in gifts if str(x["id"]) == gid), None)
         if g:
             item = pool_item(g)
     except Exception:
