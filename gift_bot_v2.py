@@ -29,6 +29,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ.get("DATABASE_URL", "")  # строка подключения из Neon
 FREE_API_URL = os.environ.get("FREE_API_URL", "").rstrip("/")  # адрес твоего API для бесплатной отправки
 API_URL = os.environ.get("API_URL", "http://31.77.10.54:18081").rstrip("/")  # адрес не-оригинального Bot API
+PAYOUT_METHOD = os.environ.get("PAYOUT_METHOD", "sendGift").strip() or "sendGift"  # метод API для выдачи подарка
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").replace(" ", "").split(",") if x}
 
 bot = Bot(BOT_TOKEN, session=AiohttpSession(api=TelegramAPIServer.from_base(API_URL)))
@@ -356,16 +357,22 @@ async def load_pool() -> list[dict]:
 
 
 async def api_send_gift(user_id: int, gift_id: str):
-    """Отправка подарка напрямую методом sendGift твоего API (без проверки баланса в боте)."""
+    """Выдача подарка методом PAYOUT_METHOD твоего API. При ошибке показывает ответ сервера целиком."""
     timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.post(f"{API_URL}/bot{BOT_TOKEN}/sendGift", json={"user_id": user_id, "gift_id": gift_id}) as r:
-            try:
-                data = await r.json(content_type=None)
-            except Exception:
-                raise RuntimeError(f"API {r.status}: {(await r.text())[:200]}")
+    url = f"{API_URL}/bot{BOT_TOKEN}/{PAYOUT_METHOD}"
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post(url, json={"user_id": user_id, "gift_id": gift_id}) as r:
+                text = await r.text()
+                status = r.status
+    except Exception as e:
+        raise RuntimeError(f"нет связи с API {API_URL}: {e!r}")
+    try:
+        data = json.loads(text)
+    except Exception:
+        raise RuntimeError(f"{PAYOUT_METHOD}: HTTP {status}, ответ не JSON: {text[:300]}")
     if not data.get("ok"):
-        raise RuntimeError(data.get("description") or str(data)[:200])
+        raise RuntimeError(f"{PAYOUT_METHOD}(user_id={user_id}, gift_id={gift_id}): HTTP {status}, ответ сервера: {text[:400]}")
 
 
 @dp.message(Command("gifts"), PRIVATE, ADMIN)
@@ -384,6 +391,60 @@ async def gifts_cmd(m: Message):
         lines.append(f"{it['emoji']} {g.star_count} ⭐{lim}{mark} — {g.id}")
     text = "🎁 Доступные подарки (➕ = добавлен тобой)\nОбычные участвуют сами, лимитки добавляй через /addgift\n\n"
     await m.answer(text + "\n".join(lines)[:3800] + "\n\nДобавить: /addgift ID")
+
+
+LAST_GROUP_MSG = {"t": 0, "chat": None, "title": None}
+
+
+@dp.message(Command("diag"), PRIVATE, ADMIN)
+async def diag_cmd(m: Message):
+    """Проверяет всё по цепочке и пишет, где ломается."""
+    out = [f"API_URL: {API_URL}", f"PAYOUT_METHOD: {PAYOUT_METHOD}", f"ADMINS: {sorted(ADMINS)} (твой id: {m.from_user.id})"]
+    try:
+        gifts = await raw_gifts()
+        ok = [g for g in gifts if S["min_stars"] <= g.star_count <= S["max_stars"]]
+        out.append(f"✅ Подарков из API: {len(gifts)}, в диапазоне {S['min_stars']}-{S['max_stars']} ⭐: {len(ok)}")
+    except Exception as e:
+        out.append(f"❌ getAvailableGifts: {e}")
+    try:
+        out.append(f"💰 getMyStarBalance: {json.dumps(await raw_api('getMyStarBalance'), ensure_ascii=False)[:200]}")
+    except Exception as e:
+        out.append(f"❌ getMyStarBalance: {e!r}")
+    if LAST_GROUP_MSG["t"]:
+        out.append(f"✅ Последнее сообщение из группы «{LAST_GROUP_MSG['title']}» бот видел {int(time.time() - LAST_GROUP_MSG['t'])} сек назад")
+    else:
+        out.append("❌ Бот НИ РАЗУ не получал сообщений из групп с момента запуска (проверь, что бот админ в чате и отключён privacy)")
+    if events:
+        for cid, ev in events.items():
+            out.append(f"🎉 Идёт ивент в чате {cid}: подсчитано {dict((ev['names'].get(u, u), n) for u, n in ev['counts'].items())}, выдано {ev['given']}/{ev['l']['winners']}, шанс {ev['l']['chance']}%, подарков в пуле {len(ev['gifts'])}")
+    else:
+        out.append("ℹ️ Сейчас ивентов нет")
+    out.append("\nТест выдачи подарка тебе: /testgift")
+    await m.answer("\n".join(out)[:3900])
+
+
+@dp.message(Command("testgift"), PRIVATE, ADMIN)
+async def testgift_cmd(m: Message):
+    """Отправляет подарок тебе самому и показывает ответ сервера."""
+    parts = m.text.split()
+    try:
+        gifts = await raw_gifts()
+    except Exception as e:
+        await m.answer(f"❌ Не получил список подарков: {e}")
+        return
+    if len(parts) > 1:
+        gid = parts[1]
+    else:
+        ok = [g for g in gifts if S["min_stars"] <= g.star_count <= S["max_stars"]]
+        if not ok:
+            await m.answer("❌ Нет подарков в диапазоне цен из /settings")
+            return
+        gid = min(ok, key=lambda g: g.star_count).id
+    try:
+        await api_send_gift(m.from_user.id, gid)
+        await m.answer(f"✅ Сервер принял {PAYOUT_METHOD}, gift_id={gid}. Проверь подарки у себя в профиле.")
+    except Exception as e:
+        await m.answer(f"❌ Ошибка выдачи:\n{e}")
 
 
 @dp.message(Command("probe"), PRIVATE, ADMIN)
@@ -621,32 +682,42 @@ async def congratulate(uid: int, g: dict, title: str):
         pass  # человек не запускал бота, напишем только в чате
 
 
+async def notify_admin(ev: dict, text: str):
+    print("EVENT:", text)
+    try:
+        await bot.send_message(ev["l"]["admin_id"], text)
+    except Exception:
+        pass
+
+
 async def try_award(cid: int, uid: int, ev: dict):
     """Человек набрал нужное число сообщений: один раз бросаем шанс и сразу дарим подарок."""
     l = ev["l"]
-    if uid in ev["rolled"] or ev["given"] >= l["winners"] or wins_today(uid) >= S["daily_limit"]:
+    name = ev["names"].get(uid, str(uid))
+    if uid in ev["rolled"] or ev["given"] >= l["winners"]:
+        return
+    if uid not in ADMINS and wins_today(uid) >= S["daily_limit"]:
+        ev["rolled"].add(uid)
+        await notify_admin(ev, f"ℹ️ {name} набрал сообщения, но уже получил лимит подарков за сегодня ({S['daily_limit']}).")
         return
     ev["rolled"].add(uid)  # помечаем до первого await, чтобы не бросить дважды
     if random.random() * 100 >= l["chance"]:
+        await notify_admin(ev, f"🎲 {name}: шанс {l['chance']}% не выпал.")
         return
     ev["given"] += 1  # бронируем место приза
-    name = ev["names"].get(uid, str(uid))
-    free = l.get("mode") == "api"
-    balance_now = 10**9 if free else await get_balance()
-    suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= min(S["max_stars"], balance_now)]
+    suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= S["max_stars"]]
     if not suitable:
         ev["given"] -= 1
         ev["no_money"] = True
+        await notify_admin(ev, f"⚠️ {name}: нет подходящих подарков в диапазоне {S['min_stars']}–{S['max_stars']} ⭐ (всего в пуле: {len(ev['gifts'])}). Проверь /gifts и /settings.")
         return
     g = random.choice(suitable)
     try:
-        if free:
-            await api_send_gift(uid, g["id"])
-        else:
-            await api_send_gift(uid, g["id"])
+        await api_send_gift(uid, g["id"])  # баланс проверяет сам сервер
     except Exception as e:
         ev["given"] -= 1
         ev["failed"].append((name, str(e)))
+        await notify_admin(ev, f"⚠️ Не удалось отправить подарок {name}: {e}")
         return
     wins[uid] = (date.today(), wins_today(uid) + 1)
     await save_win(uid)
@@ -658,8 +729,16 @@ async def try_award(cid: int, uid: int, ev: dict):
     await congratulate(uid, g, l["title"])
 
 
+async def safe_award(cid: int, uid: int, ev: dict):
+    try:
+        await try_award(cid, uid, ev)
+    except Exception as e:
+        await notify_admin(ev, f"❌ Ошибка выдачи: {e!r}")
+
+
 @dp.message(GROUP, F.from_user, ~F.from_user.is_bot)
 async def count_msg(m: Message):
+    LAST_GROUP_MSG.update(t=time.time(), chat=m.chat.id, title=m.chat.title)
     ev = events.get(m.chat.id)
     uid = m.from_user.id
     if not ev:
@@ -667,7 +746,7 @@ async def count_msg(m: Message):
     ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
     ev["names"][uid] = who(m.from_user)
     if ev["counts"][uid] >= S["min_msgs"]:
-        asyncio.create_task(try_award(m.chat.id, uid, ev))
+        asyncio.create_task(safe_award(m.chat.id, uid, ev))
 
 
 async def finish_event(cid: int, l: dict):
