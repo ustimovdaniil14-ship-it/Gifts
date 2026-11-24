@@ -725,7 +725,7 @@ async def go_cb(c: CallbackQuery):
     l["admin_id"] = c.from_user.id
     events[cid] = {
         "counts": {}, "names": {}, "last": {}, "l": l,
-        "rolled": set(), "given": 0, "won": [], "failed": [], "no_money": False,
+        "rolled": set(), "pending": 0, "given": 0, "won": [], "failed": [], "no_money": False,
         "gifts": await load_pool(),
     }
     last_event[cid] = time.time()
@@ -737,7 +737,7 @@ async def go_cb(c: CallbackQuery):
             f"💬 Пиши и активничай в чате, чтобы получить награду!\n"
             f"🎁 Приз: подарок на {S['min_stars']}–{S['max_stars']} ⭐\n"
             f"⏳ Ивент идёт {l['minutes']} мин\n"
-            f"📝 Нужно минимум {S['min_msgs']} сообщений, чтобы участвовать. Дальше всё решает шанс, подарки падают в случайные моменты прямо во время ивента!\n\n"
+            f"📝 Просто пиши в чат! Подарок падает случайно, прямо на чьё-то сообщение. Не за активность, а как повезёт 🍀\n\n"
             f"Удачи! 🍀",
         )
     except Exception as e:
@@ -779,17 +779,10 @@ async def notify_admin(ev: dict, text: str):
         pass
 
 
-async def award_one(cid: int, ev: dict) -> bool:
-    """Выдаёт один подарок случайному активному участнику (все участники равны).
-    True = место обработано, False = пока некому дарить (попробуем позже)."""
+async def award_to(cid: int, ev: dict, uid: int) -> bool:
+    """Подарок человеку, которому повезло: он просто написал сообщение в момент выпадения.
+    True = подарок выдан или нет смысла пробовать снова, False = не получилось отправить (место вернётся в очередь)."""
     l = ev["l"]
-    eligible = [
-        u for u, n in ev["counts"].items()
-        if n >= S["min_msgs"]  # без лимитов: один человек может получить сколько угодно подарков
-    ]
-    if not eligible:
-        return False
-    uid = random.choice(eligible)  # все равны, количество сообщений не влияет
     name = ev["names"].get(uid, str(uid))
     suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= S["max_stars"]]
     if not suitable:
@@ -815,6 +808,15 @@ async def award_one(cid: int, ev: dict) -> bool:
     return True
 
 
+async def drop_gift(cid: int, ev: dict, uid: int):
+    try:
+        if not await award_to(cid, ev, uid) and len(ev["failed"]) < 5:
+            ev["pending"] += 1  # не отправилось, подарок достанется следующему
+    except Exception as e:
+        ev["pending"] += 1
+        await notify_admin(ev, f"❌ Ошибка выдачи: {e!r}")
+
+
 async def run_slots(cid: int, ev: dict):
     """Шанс бросается отдельно на каждый подарок. Выпавшие подарки падают в случайные моменты ивента."""
     try:
@@ -832,12 +834,9 @@ async def run_slots(cid: int, ev: dict):
             wait = start + off - time.time()
             if wait > 0:
                 await asyncio.sleep(wait)
-            while events.get(cid) is ev:
-                if await award_one(cid, ev):
-                    break
-                await asyncio.sleep(5)  # некому дарить, ждём активности
             if events.get(cid) is not ev:
                 return
+            ev["pending"] += 1  # подарок выпал: достанется тому, кто следующим напишет в чат
     except Exception as e:
         await notify_admin(ev, f"❌ Ошибка выдачи: {e!r}")
 
@@ -851,6 +850,9 @@ async def count_msg(m: Message):
         return
     ev["counts"][uid] = ev["counts"].get(uid, 0) + 1
     ev["names"][uid] = who(m.from_user)
+    if ev["pending"] > 0:  # просто написал сообщение, и именно ему повезло
+        ev["pending"] -= 1
+        asyncio.create_task(drop_gift(m.chat.id, ev, uid))
 
 
 async def finish_event(cid: int, l: dict):
@@ -872,7 +874,7 @@ async def finish_event(cid: int, l: dict):
     for n, err in ev["failed"]:
         report.append(f"⚠️ Не удалось отправить {n}: {err}\n(человек должен хотя бы раз запустить бота в личке)")
     if ev.get("live", 0) > len(ev["won"]) and not ev["failed"] and not ev["no_money"]:
-        report.append(f"ℹ️ Должно было выпасть {ev['live']}, выдано {len(ev['won'])}: не хватило участников, набравших {S['min_msgs']} сообщений.")
+        report.append(f"ℹ️ Должно было выпасть {ev['live']}, выдано {len(ev['won'])}: никто не написал после выпадения подарка (осталось без получателя: {ev['pending']}).")
     if report:
         try:
             await bot.send_message(l["admin_id"], "\n\n".join(report))
@@ -942,9 +944,12 @@ async def poll_updates():
                 print("getUpdates:", data)
                 await asyncio.sleep(3)
                 continue
-            for u in data.get("result", []):
+            res = data.get("result", [])
+            for u in res:
                 offset = u["update_id"] + 1
                 asyncio.create_task(handle_update(u))
+            if not res:
+                await asyncio.sleep(0.3)  # если сервер отвечает мгновенно, не крутим цикл вхолостую
         except asyncio.CancelledError:
             raise
         except Exception as e:
