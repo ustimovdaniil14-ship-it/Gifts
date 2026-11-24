@@ -898,6 +898,61 @@ async def init_me():
     print("Бот:", bot._me.username)
 
 
+async def handle_update(u: dict):
+    """Один апдейт в aiogram. Если aiogram не разобрал (у твоего API не все поля), пробуем без вложений."""
+    try:
+        await dp.feed_raw_update(bot, u)
+        return
+    except Exception as e:
+        first = repr(e)[:200]
+    msg = u.get("message")
+    if isinstance(msg, dict):
+        for k in ("poll", "sticker", "video", "animation", "video_note", "document", "photo", "audio", "voice"):
+            msg.pop(k, None)
+        try:
+            await dp.feed_raw_update(bot, u)
+            return
+        except Exception:
+            pass
+    print("Пропущен апдейт", u.get("update_id"), first)
+
+
+async def poll_updates():
+    """Свой long polling: один кривой апдейт (например опрос без поля members_only)
+    больше не ломает получение всех остальных сообщений."""
+    used = dp.resolve_used_update_types()
+    offset = None
+    # пропускаем накопившуюся очередь, чтобы бот не отвечал на старые сообщения
+    try:
+        data = await raw_api("getUpdates", offset=-1, timeout=0)
+        res = data.get("result") or []
+        if res:
+            offset = res[-1]["update_id"] + 1
+    except Exception as e:
+        print("Не удалось пропустить очередь:", e)
+    print("Polling запущен")
+    while True:
+        try:
+            params = {"timeout": 20, "allowed_updates": used}
+            if offset is not None:
+                params["offset"] = offset
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as sess:
+                async with sess.post(f"{API_URL}/bot{BOT_TOKEN}/getUpdates", json=params) as r:
+                    data = await r.json(content_type=None)
+            if not data.get("ok"):
+                print("getUpdates:", data)
+                await asyncio.sleep(3)
+                continue
+            for u in data.get("result", []):
+                offset = u["update_id"] + 1
+                asyncio.create_task(handle_update(u))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("Ошибка polling:", repr(e)[:200])
+            await asyncio.sleep(3)
+
+
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
@@ -906,7 +961,7 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
     await init_me()
     await init_db()
-    await dp.start_polling(bot)
+    await poll_updates()
 
 
 if __name__ == "__main__":
