@@ -47,7 +47,7 @@ LABELS = {
     "min_stars": "Мин. цена гифта (⭐)",
     "max_stars": "Макс. цена гифта (⭐)",
     "min_msgs": "Мин. сообщений в чате для участия",
-    "daily_limit": "Макс. подарков одному человеку в сутки",
+    "daily_limit": "Макс. подарков одному человеку в сутки (не используется, лимита нет)",
 }
 
 
@@ -785,16 +785,14 @@ async def award_one(cid: int, ev: dict) -> bool:
     l = ev["l"]
     eligible = [
         u for u, n in ev["counts"].items()
-        if n >= S["min_msgs"] and u not in ev["rolled"] and (u in ADMINS or wins_today(u) < S["daily_limit"])
+        if n >= S["min_msgs"]  # без лимитов: один человек может получить сколько угодно подарков
     ]
     if not eligible:
         return False
     uid = random.choice(eligible)  # все равны, количество сообщений не влияет
-    ev["rolled"].add(uid)  # один подарок на человека за ивент
     name = ev["names"].get(uid, str(uid))
     suitable = [g for g in ev["gifts"] if S["min_stars"] <= g["stars"] <= S["max_stars"]]
     if not suitable:
-        ev["rolled"].discard(uid)
         ev["no_money"] = True
         await notify_admin(ev, f"⚠️ Нет подходящих подарков в диапазоне {S['min_stars']}–{S['max_stars']} ⭐ (всего в пуле: {len(ev['gifts'])}). Проверь /gifts и /settings.")
         return True
@@ -822,7 +820,8 @@ async def run_slots(cid: int, ev: dict):
     try:
         l = ev["l"]
         total = l["minutes"] * 60
-        live = sum(1 for _ in range(l["winners"]) if random.random() * 100 < l["chance"])
+        exact = l["winners"] * l["chance"] / 100  # 100% = все подарки, 75% = три четверти, остаток по шансу
+        live = int(exact) + (1 if random.random() < exact - int(exact) else 0)
         ev["live"] = live
         await notify_admin(ev, f"🎲 Шанс {l['chance']}%: из {l['winners']} подарков выпадет {live}.")
         if not live:
